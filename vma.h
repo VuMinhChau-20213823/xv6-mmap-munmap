@@ -1,5 +1,9 @@
 // kernel/vma.h
 // Cau truc vung nho ao (VMA) cho xv6-riscv.
+//
+// Moi tien trinh co mot bang NVMA phan tu (p->vmas) va mot danh sach lien ket
+// don (p->vma_head -> vm_next) noi cac VMA dang dung, SAP XEP TANG DAN theo
+// vm_start, khong chong lan, nam trong [MMAP_BASE, MMAP_TOP).
 
 #ifndef VMA_H
 #define VMA_H
@@ -18,6 +22,16 @@
 // Bit "dirty" phan mem (dung bit RSW trong PTE) cho MAP_SHARED + PROT_WRITE
 #define VMA_PTE_DIRTY (1L << 8)
 
+// 1 = fork CHIA SE trang vat ly cua vung MAP_SHARED giua cha va con
+//     (dung bo dem tham chieu trang trong vma.c);
+// 0 = hanh vi cu: sao chep rieng tung trang.
+#define VMA_SHARE_PAGES 1
+
+// 1 = sau moi mmap / munmap / fork, kiem tra tinh toan ven cua danh sach VMA
+// (sap xep, khong chong lan, can theo trang, dung so luong) va panic neu sai.
+// Dat 0 de tat.
+#define VMA_DEBUG 1
+
 struct file;
 
 struct vm_area_struct {
@@ -30,5 +44,11 @@ struct vm_area_struct {
   struct vm_area_struct *vm_next;  // danh sach lien ket, sap xep tang dan theo vm_start
   int vm_used;                     // slot dang duoc su dung
 };
+
+// Chinh sach tim khoang trong hien tai (VMA_FIRST_FIT hoac VMA_BEST_FIT)
+extern int vma_policy;
+
+// Kich thuoc (byte) cua mot VMA
+#define VMA_LEN(v) ((v)->vm_end - (v)->vm_start)
 
 #endif

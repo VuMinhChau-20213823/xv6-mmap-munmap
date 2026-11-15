@@ -1,10 +1,14 @@
 // kernel/vma.c
 // Quan ly VMA (vm_area_struct) cho xv6-riscv:
 //  - danh sach lien ket VMA (sap xep theo dia chi) trong moi tien trinh
-//  - tim khoang trong First-Fit / Best-Fit
+//  - tim khoang trong First-Fit / Best-Fit (hoac dung goi y addr neu con trong)
 //  - mmap / munmap (cat dau, cat duoi, tach doi, xoa han)
+//  - gop cac VMA ke nhau co cung thuoc tinh (giam so VMA, chong phan manh)
 //  - lazy allocation khi page fault
 //  - write-back trang dirty cua MAP_SHARED, sao chep VMA khi fork
+//  - fork chia se trang vat ly cua vung MAP_SHARED (cha va con cung tro vao
+//    mot dia chi vat ly) + bo dem tham chieu (reference count) cho trang
+//  - kiem tra tinh toan ven cua danh sach (VMA_DEBUG)
 
 #include "types.h"
 #include "riscv.h"
@@ -22,6 +26,52 @@
 pte_t *walk(pagetable_t, uint64, int);   // dinh nghia trong vm.c
 
 int vma_policy = VMA_BEST_FIT;           // chien luoc hien tai (doi bang syscall vmapolicy)
+
+// ---------------------------------------------------------------
+// Bo dem tham chieu (reference count) cho cac trang vat ly cua vung mmap.
+// pgref[i] = so tien trinh dang map trang vat ly thu i.
+//  - trang vua cap phat de nap vao mot VMA: ref = 1
+//  - fork chia se them 1 tien trinh: ref++
+//  - munmap / exit: ref--, chi khi ref == 0 moi tra trang ve kalloc (kfree)
+// Dung phep nguyen tu cua GCC nen khong can khoa.
+// ---------------------------------------------------------------
+#define PGREF_N ((PHYSTOP - KERNBASE) / PGSIZE)
+static int pgref[PGREF_N];
+
+static int
+pgref_idx(uint64 pa)
+{
+  if(pa % PGSIZE || pa < KERNBASE || pa >= PHYSTOP)
+    panic("pgref_idx");
+  return (pa - KERNBASE) / PGSIZE;
+}
+
+static void
+pgref_init(void *mem)                    // trang moi: ref = 1
+{
+  int i = pgref_idx((uint64)mem);
+  if(pgref[i] != 0)
+    panic("pgref_init: page already referenced");
+  pgref[i] = 1;
+}
+
+static void
+pgref_inc(uint64 pa)                     // them mot tien trinh cung dung trang
+{
+  if(__sync_add_and_fetch(&pgref[pgref_idx(pa)], 1) < 2)
+    panic("pgref_inc");
+}
+
+// Tra lai 1 tham chieu; giai phong trang vat ly khi khong con ai dung.
+static void
+vma_put_page(uint64 pa)
+{
+  int n = __sync_sub_and_fetch(&pgref[pgref_idx(pa)], 1);
+  if(n < 0)
+    panic("vma_put_page: refcount < 0");
+  if(n == 0)
+    kfree((void*)pa);
+}
 
 // ---------------------------------------------------------------
 // Tien ich
@@ -91,6 +141,79 @@ vma_init(struct proc *p)
 }
 
 // ---------------------------------------------------------------
+// Kiem tra tinh toan ven cua danh sach VMA (chi chay khi VMA_DEBUG != 0):
+//  - moi nut dang dung, can theo trang, vm_start < vm_end
+//  - sap xep tang dan, khong chong lan, nam trong [MMAP_BASE, MMAP_TOP)
+//  - khong co vong lap; so nut trong danh sach = so slot dang dung
+// ---------------------------------------------------------------
+static void
+vma_check(struct proc *p)
+{
+#if VMA_DEBUG
+  int used = 0, listed = 0;
+  uint64 last_end = MMAP_BASE;
+
+  for(int i = 0; i < NVMA; i++)
+    if(p->vmas[i].vm_used)
+      used++;
+
+  for(struct vm_area_struct *v = p->vma_head; v; v = v->vm_next){
+    if(++listed > NVMA)
+      panic("vma_check: cycle");
+    if(!v->vm_used)
+      panic("vma_check: unused node in list");
+    if(v->vm_start % PGSIZE || v->vm_end % PGSIZE)
+      panic("vma_check: not page aligned");
+    if(v->vm_start >= v->vm_end)
+      panic("vma_check: empty or negative vma");
+    if(v->vm_start < last_end)
+      panic("vma_check: overlap or bad order");
+    if(v->vm_end > MMAP_TOP)
+      panic("vma_check: beyond MMAP_TOP");
+    last_end = v->vm_end;
+  }
+  if(listed != used)
+    panic("vma_check: slot count mismatch");
+#else
+  (void)p;
+#endif
+}
+
+// ---------------------------------------------------------------
+// Gop VMA: hai VMA ke nhau (a ngay truoc b) gop duoc khi lien tiep ve dia chi
+// va giong het ve prot, flags, file (va offset trong file lien tiep).
+// ---------------------------------------------------------------
+static int
+vma_can_merge(struct vm_area_struct *a, struct vm_area_struct *b)
+{
+  if(a->vm_end != b->vm_start)
+    return 0;
+  if(a->vm_prot != b->vm_prot || a->vm_flags != b->vm_flags)
+    return 0;
+  if(a->vm_file != b->vm_file)
+    return 0;
+  if(a->vm_file && a->vm_pgoff + VMA_LEN(a) != b->vm_pgoff)
+    return 0;
+  return 1;
+}
+
+// Gop a voi VMA ke sau no neu duoc. Tra ve 1 neu da gop (b bi xoa).
+static int
+vma_merge_next(struct vm_area_struct *a)
+{
+  struct vm_area_struct *b = a->vm_next;
+
+  if(b == 0 || !vma_can_merge(a, b))
+    return 0;
+  a->vm_end = b->vm_end;
+  a->vm_next = b->vm_next;
+  if(b->vm_file)
+    fileclose(b->vm_file);               // b giu 1 tham chieu rieng; a van con tham chieu cua no
+  vma_free_slot(b);
+  return 1;
+}
+
+// ---------------------------------------------------------------
 // Thuat toan cap phat: First-Fit / Best-Fit tren cac "lo trong"
 // giua cac VMA lien tiep trong [MMAP_BASE, MMAP_TOP).
 // Tra ve dia chi dau lo trong (0 neu khong co); *prev_out = VMA
@@ -132,6 +255,29 @@ vma_find_gap(struct proc *p, uint64 len, struct vm_area_struct **prev_out)
   return best_start;
 }
 
+// Goi y addr: dung duoc neu can theo trang, nam trong [MMAP_BASE, MMAP_TOP)
+// va [addr, addr+len) khong cat VMA nao. *prev_out = VMA dung truoc vung do.
+static int
+vma_hint_ok(struct proc *p, uint64 addr, uint64 len, struct vm_area_struct **prev_out)
+{
+  struct vm_area_struct *v, *prev = 0;
+  uint64 end = addr + len;
+
+  if(addr == 0 || addr % PGSIZE || end < addr || addr < MMAP_BASE || end > MMAP_TOP)
+    return 0;
+  for(v = p->vma_head; v; v = v->vm_next){
+    if(v->vm_end <= addr){
+      prev = v;
+      continue;
+    }
+    if(v->vm_start >= end)
+      break;
+    return 0;                                   // chong lan voi VMA co san
+  }
+  *prev_out = prev;
+  return 1;
+}
+
 // ---------------------------------------------------------------
 // mmap
 // ---------------------------------------------------------------
@@ -140,10 +286,9 @@ vma_mmap(struct proc *p, uint64 addr, uint64 length, int prot, int flags,
          int fd, uint64 offset)
 {
   struct file *f = 0;
-  struct vm_area_struct *v, *prev = 0;
+  struct vm_area_struct *v, *cur, *prev = 0;
   uint64 start;
 
-  (void)addr;                                   // addr chi la goi y, bo qua
   if(length == 0 || length > MMAP_TOP - MMAP_BASE)
     return -1;
   length = PGROUNDUP(length);
@@ -161,14 +306,19 @@ vma_mmap(struct proc *p, uint64 addr, uint64 length, int prot, int flags,
       return -1;
     if((flags & MAP_SHARED) && (prot & PROT_WRITE) && !f->writable)
       return -1;
-    if(offset % PGSIZE)
+    if(offset % PGSIZE || offset + length < offset)
       return -1;
   }
 
   v = vma_alloc(p);
   if(v == 0)
     return -1;
-  start = vma_find_gap(p, length, &prev);
+
+  // addr la goi y: dung neu vung do con trong, nguoc lai chon theo chinh sach
+  if(addr != 0 && vma_hint_ok(p, addr, length, &prev))
+    start = addr;
+  else
+    start = vma_find_gap(p, length, &prev);
   if(start == 0){
     vma_free_slot(v);
     return -1;
@@ -188,6 +338,14 @@ vma_mmap(struct proc *p, uint64 addr, uint64 length, int prot, int flags,
     v->vm_next = p->vma_head;
     p->vma_head = v;
   }
+
+  // Gop voi VMA lien ke (truoc va/hoac sau) neu cung thuoc tinh
+  cur = v;
+  if(prev && vma_merge_next(prev))
+    cur = prev;
+  vma_merge_next(cur);
+
+  vma_check(p);
   return start;
 }
 
@@ -246,7 +404,7 @@ vma_flush_range(struct proc *p, struct vm_area_struct *v,
   }
 }
 
-// Giai phong cac trang vat ly dang map trong [s, t) (co write-back neu can).
+// Go cac trang dang map trong [s, t): write-back neu can, roi tra tham chieu.
 static void
 vma_unmap_pages(struct proc *p, struct vm_area_struct *v, uint64 s, uint64 t)
 {
@@ -255,7 +413,7 @@ vma_unmap_pages(struct proc *p, struct vm_area_struct *v, uint64 s, uint64 t)
     pte_t *pte = walk(p->pagetable, a, 0);
     if(pte == 0 || (*pte & PTE_V) == 0)
       continue;
-    kfree((void*)PTE2PA(*pte));
+    vma_put_page(PTE2PA(*pte));          // tra 1 tham chieu (chi free khi ref == 0)
     *pte = 0;
   }
   sfence_vma();
@@ -275,6 +433,8 @@ vma_munmap(struct proc *p, uint64 addr, uint64 length)
   uint64 end;
 
   if(addr % PGSIZE || length == 0)
+    return -1;
+  if(length > MMAP_TOP - MMAP_BASE)
     return -1;
   length = PGROUNDUP(length);
   end = addr + length;
@@ -334,6 +494,8 @@ vma_munmap(struct proc *p, uint64 addr, uint64 length)
     prev = v;
     v = next;
   }
+
+  vma_check(p);
   return 0;
 }
 
@@ -342,6 +504,42 @@ void
 vma_unmap_all(struct proc *p)
 {
   vma_munmap(p, MMAP_BASE, MMAP_TOP - MMAP_BASE);
+}
+
+// Cap phat 1 trang vat ly, nap noi dung (0 hoac tu file), map vao tien trinh p
+// tai dia chi a (can theo trang) va dat ref = 1. is_write: lan truy cap dau la ghi.
+static int
+vma_populate(struct proc *p, struct vm_area_struct *v, uint64 a, int is_write)
+{
+  char *mem;
+  int perm;
+
+  mem = kalloc();
+  if(mem == 0)
+    return -1;
+  memset(mem, 0, PGSIZE);
+
+  if(v->vm_file){
+    struct inode *ip = v->vm_file->ip;
+    uint64 off = v->vm_pgoff + (a - v->vm_start);
+    ilock(ip);
+    readi(ip, 0, (uint64)mem, off, PGSIZE);     // phan vuot qua EOF van la 0
+    iunlock(ip);
+  }
+
+  perm = prot_to_pte(v->vm_prot);
+  if(vma_is_shared_rw(v)){
+    if(is_write)
+      perm |= VMA_PTE_DIRTY;                    // ghi ngay: danh dau dirty
+    else
+      perm &= ~PTE_W;                           // doc truoc: map read-only
+  }
+  if(mappages(p->pagetable, a, PGSIZE, (uint64)mem, perm) != 0){
+    kfree(mem);
+    return -1;
+  }
+  pgref_init(mem);
+  return 0;
 }
 
 // ---------------------------------------------------------------
@@ -355,7 +553,6 @@ vma_fault(struct proc *p, uint64 va, uint64 scause)
   struct vm_area_struct *v;
   pte_t *pte;
   uint64 a;
-  char *mem;
   int need, is_write = 0;
 
   if(va >= MAXVA)
@@ -384,38 +581,18 @@ vma_fault(struct proc *p, uint64 va, uint64 scause)
     return -1;
   }
 
-  mem = kalloc();
-  if(mem == 0)
-    return -1;
-  memset(mem, 0, PGSIZE);
-
-  if(v->vm_file){
-    struct inode *ip = v->vm_file->ip;
-    uint64 off = v->vm_pgoff + (a - v->vm_start);
-    ilock(ip);
-    readi(ip, 0, (uint64)mem, off, PGSIZE);     // phan vuot qua EOF van la 0
-    iunlock(ip);
-  }
-
-  int perm = prot_to_pte(v->vm_prot);
-  if(vma_is_shared_rw(v)){
-    if(is_write)
-      perm |= VMA_PTE_DIRTY;                    // ghi ngay: danh dau dirty
-    else
-      perm &= ~PTE_W;                           // doc truoc: map read-only
-  }
-  if(mappages(p->pagetable, a, PGSIZE, (uint64)mem, perm) != 0){
-    kfree(mem);
-    return -1;
-  }
-  return 0;
+  return vma_populate(p, v, a, is_write);
 }
 
 // ---------------------------------------------------------------
 // fork: sao chep danh sach VMA (giu nguyen thu tu dia chi).
-//  - MAP_PRIVATE / anonymous: sao chep cac trang da co mat
-//  - MAP_SHARED co file: ghi cac trang dirty cua cha ve file, con se
-//    lazy-fault doc lai tu file (chua chia se trang vat ly)
+//  - MAP_SHARED (VMA_SHARE_PAGES = 1): cha va con CUNG TRO VAO MOT TRANG VAT LY.
+//      + trang chua co mat o cha duoc nap truoc (anonymous: trang 0; file: doc
+//        tu file) de moi trang cua vung deu duoc chia se ngay tu luc fork;
+//      + moi trang vat ly duoc tang bo dem tham chieu (pgref_inc);
+//      + vung co file va ghi duoc: con map read-only va co bit dirty rieng,
+//        de ghi cua con duoc ghi ve file khi con munmap / exit.
+//  - MAP_PRIVATE: van sao chep rieng tung trang da co mat.
 // Phai goi KHI KHONG giu spinlock (co the ngu khi truy cap file).
 // ---------------------------------------------------------------
 int
@@ -438,10 +615,35 @@ vma_fork(struct proc *p, struct proc *np)
     if(tail) tail->vm_next = nv; else np->vma_head = nv;
     tail = nv;
 
-    if(pv->vm_file && (pv->vm_flags & MAP_SHARED)){
+    if(pv->vm_prot == 0)                        // PROT_NONE: khong co gi de chia se / sao chep
+      continue;
+
+    if(VMA_SHARE_PAGES && (pv->vm_flags & MAP_SHARED)){
+      for(uint64 a = pv->vm_start; a < pv->vm_end; a += PGSIZE){
+        pte_t *pte = walk(p->pagetable, a, 0);
+        uint64 pa;
+        int perm;
+        if(pte == 0 || (*pte & PTE_V) == 0){
+          if(vma_populate(p, pv, a, 0) < 0)     // nap truoc o cha de co trang chung
+            goto bad;
+          pte = walk(p->pagetable, a, 0);
+        }
+        pa = PTE2PA(*pte);
+        perm = *pte & (PTE_R | PTE_W | PTE_X | PTE_U);
+        if(vma_is_shared_rw(pv))
+          perm &= ~PTE_W;                       // con tu theo doi dirty cua minh
+        if(mappages(np->pagetable, a, PGSIZE, pa, perm) != 0)
+          goto bad;
+        pgref_inc(pa);                          // them 1 tien trinh dung trang nay
+      }
+      continue;
+    }
+
+    if(pv->vm_file && (pv->vm_flags & MAP_SHARED)){   // chi khi VMA_SHARE_PAGES = 0
       vma_flush_range(p, pv, pv->vm_start, pv->vm_end, 1);
       continue;
     }
+
     for(uint64 a = pv->vm_start; a < pv->vm_end; a += PGSIZE){
       pte_t *pte = walk(p->pagetable, a, 0);
       char *mem;
@@ -456,8 +658,10 @@ vma_fork(struct proc *p, struct proc *np)
         kfree(mem);
         goto bad;
       }
+      pgref_init(mem);
     }
   }
+  vma_check(np);
   return 0;
 
 bad:

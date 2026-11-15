@@ -242,6 +242,160 @@ test_fit_policy(void)
   munmap(r[4], PG);
 }
 
+
+static void
+test_merge(void)
+{
+  printf("[10] gop VMA: 40 mapping 1 trang lien tiep (vuot NVMA=16)\n");
+  char *r[40];
+  int ok = 1, contiguous = 1;
+  for(int i = 0; i < 40; i++){
+    r[i] = mmap(0, PG, RW, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if(failed(r[i])){ ok = 0; break; }
+    if(i > 0 && r[i] != r[0] + i * PG) contiguous = 0;
+  }
+  check(ok, "40 lan mmap deu thanh cong (neu khong gop VMA se het 16 slot)");
+  check(ok && contiguous, "cac vung nam lien tiep nhau");
+  if(ok){
+    for(int i = 0; i < 40; i++) r[i][0] = i + 1;
+    int good = 1;
+    for(int i = 0; i < 40; i++) if(r[i][0] != i + 1) good = 0;
+    check(good, "ghi/doc dung tren ca 40 trang");
+    check(munmap(r[0] + 10 * PG, 5 * PG) == 0, "munmap 5 trang giua vung da gop (tach doi)");
+    check(r[0][0] == 1 && r[9][0] == 10 && r[15][0] == 16 && r[39][0] == 40,
+          "cac trang con lai nguyen ven");
+    munmap(r[0], 10 * PG);
+    munmap(r[0] + 15 * PG, 25 * PG);
+  }
+}
+
+static void
+test_hint(void)
+{
+  printf("[11] goi y dia chi addr\n");
+  char *b = mmap(0, PG, RW, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if(failed(b)){ check(0, "mmap"); return; }
+  char *want = b + 20 * PG;
+  char *h = mmap(want, PG, RW, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  check(h == want, "vung trong -> kernel dung dung dia chi goi y");
+  char *h2 = mmap(want, PG, RW, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  check(!failed(h2) && h2 != want, "vung da bi chiem -> kernel chon cho khac (khong loi)");
+  if(!failed(h)) munmap(h, PG);
+  if(!failed(h2)) munmap(h2, PG);
+  munmap(b, PG);
+}
+
+static void
+test_shared_anon_fork(void)
+{
+  printf("[12] MAP_SHARED|ANONYMOUS: cha va con dung chung trang vat ly\n");
+  char *p = mmap(0, 2 * PG, RW, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+  if(failed(p)){ check(0, "mmap shared anonymous"); return; }
+  p[0] = 1;                          // chi cham trang 0 truoc khi fork
+  int pid = fork();
+  if(pid == 0){
+    if(p[0] != 1) exit(1);
+    p[0] = 42;                       // trang da co mat
+    p[PG] = 43;                      // trang chua cham truoc khi fork
+    exit(0);
+  }
+  int st = -1;
+  wait(&st);
+  check(st == 0, "con doc dung du lieu cha da ghi");
+  check(p[0] == 42, "cha thay NGAY thay doi cua con (trang da co mat)");
+  check(p[PG] == 43, "cha thay NGAY thay doi cua con (trang chua cham truoc fork)");
+  munmap(p, 2 * PG);
+}
+
+static void
+test_shared_file_fork(void)
+{
+  printf("[13] MAP_SHARED file: cha va con chia se trang, du lieu xuong dia dung\n");
+  make_file("mm.tmp");
+  int fd = open("mm.tmp", O_RDWR);
+  char *p = mmap(0, 2 * PG, RW, MAP_SHARED, fd, 0);
+  if(failed(p)){ check(0, "mmap file shared"); close(fd); return; }
+  char c = p[0];                     // trang 0 da co mat, trang 1 chua
+  (void)c;
+  int pid = fork();
+  if(pid == 0){
+    p[10] = 'K';
+    p[PG + 10] = 'L';
+    exit(0);
+  }
+  int st = -1;
+  wait(&st);
+  check(p[10] == 'K' && p[PG + 10] == 'L', "cha thay ngay thay doi cua con truoc khi munmap");
+  p[20] = 'M';
+  munmap(p, 2 * PG);
+  close(fd);
+
+  fd = open("mm.tmp", O_RDONLY);
+  p = mmap(0, 2 * PG, PROT_READ, MAP_SHARED, fd, 0);
+  check(!failed(p) && p[10] == 'K' && p[PG + 10] == 'L' && p[20] == 'M',
+        "ca thay doi cua con va cha deu nam tren file");
+  if(!failed(p)) munmap(p, 2 * PG);
+  close(fd);
+}
+
+static void
+test_refcount_alive(void)
+{
+  printf("[14] reference count: trang khong bi giai phong khi con tien trinh dung\n");
+  int fds[2];
+  if(pipe(fds) < 0){ check(0, "pipe"); return; }
+  char *p = mmap(0, PG, RW, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+  if(failed(p)){ check(0, "mmap"); return; }
+  p[0] = 7;
+  int pid = fork();
+  if(pid == 0){
+    char b;
+    close(fds[1]);
+    read(fds[0], &b, 1);             // cho cha munmap xong
+    if(p[0] != 7) exit(1);           // neu trang bi free nham, noi dung se bi ghi de
+    p[0] = 8;
+    if(p[0] != 8) exit(2);
+    exit(0);
+  }
+  close(fds[0]);
+  munmap(p, PG);                     // cha tra tham chieu cua minh
+  for(int i = 0; i < 20; i++){       // tao ap luc cap phat: trang bi free nham se bi dung lai
+    char *q = mmap(0, 16 * PG, RW, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if(!failed(q)){
+      for(int j = 0; j < 16; j++) q[j * PG] = 99;
+      munmap(q, 16 * PG);
+    }
+  }
+  write(fds[1], "x", 1);
+  close(fds[1]);
+  int st = -1;
+  wait(&st);
+  check(st == 0, "con van doc/ghi duoc trang sau khi cha da munmap");
+}
+
+static void
+test_share_stress(void)
+{
+  printf("[15] 300 chu ky fork voi vung shared 100 trang (ro ri / free 2 lan)\n");
+  int ok = 1;
+  for(int i = 0; i < 300 && ok; i++){
+    char *p = mmap(0, 100 * PG, RW, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if(failed(p)){ ok = 0; break; }
+    for(int j = 0; j < 100; j += 2) p[j * PG] = 1;
+    int pid = fork();
+    if(pid < 0){ ok = 0; munmap(p, 100 * PG); break; }
+    if(pid == 0){
+      for(int j = 1; j < 100; j += 2) p[j * PG] = 2;
+      exit(0);
+    }
+    int st = -1;
+    wait(&st);
+    for(int j = 1; j < 100; j += 2) if(p[j * PG] != 2) ok = 0;
+    if(munmap(p, 100 * PG) != 0) ok = 0;
+  }
+  check(ok, "300 chu ky hoan tat, bo nho khong can (khong ro ri), khong hong");
+}
+
 static void
 test_leak(void)
 {
@@ -267,6 +421,12 @@ main(void)
   test_fork();
   test_two_processes_share_file();
   test_fit_policy();
+  test_merge();
+  test_hint();
+  test_shared_anon_fork();
+  test_shared_file_fork();
+  test_refcount_alive();
+  test_share_stress();
   test_leak();
   unlink("mm.tmp");
   if(fails == 0)
